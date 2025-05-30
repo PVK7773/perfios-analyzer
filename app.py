@@ -1,22 +1,30 @@
+
 import streamlit as st
 import pandas as pd
 import re
 from PyPDF2 import PdfReader
-from io import BytesIO
-from fpdf import FPDF
 from datetime import datetime
+from io import BytesIO
 
-st.set_page_config(page_title="Multi-Bank Statement Analyzer", layout="wide")
-st.title("🏦 Multi-Bank Statement Analyzer (ICICI, HDFC, SBI)")
+st.set_page_config(page_title="Multi-Bank Analyzer - Phase 2", layout="wide")
+st.title("🏦 Multi-Bank Financial Analyzer (ICICI, HDFC, SBI)")
 
 uploaded_file = st.file_uploader("Upload your bank statement PDF", type=["pdf"])
+pdf_password = st.text_input("PDF Password (if any)", type="password")
 
-def extract_text_from_pdf(file):
-    reader = PdfReader(file)
-    text = ""
-    for page in reader.pages:
-        text += page.extract_text()
-    return text
+def extract_text(file, password=None):
+    try:
+        reader = PdfReader(file)
+        if reader.is_encrypted:
+            if password:
+                reader.decrypt(password)
+            else:
+                st.warning("PDF is encrypted. Please provide password.")
+                return ""
+        return "".join([page.extract_text() for page in reader.pages])
+    except Exception as e:
+        st.error(f"Failed to extract text: {e}")
+        return ""
 
 def detect_bank(text):
     if "ICICI BANK" in text.upper():
@@ -29,79 +37,81 @@ def detect_bank(text):
         return "UNKNOWN"
 
 def parse_icici(text):
-    pattern = re.compile(r"(\d{2}/\d{2}/\d{4})\s+(.+?)\s+((?:\d{1,3},?)+\.\d{2})?\s+((?:\d{1,3},?)+\.\d{2})?\s+((?:\d{1,3},?)+\.\d{2})")
-    transactions = []
+    pattern = re.compile(r"(\d{2}/\d{2}/\d{4})\s+(.+?)\s+((?:\d{1,3},?)*\d+\.\d{2})?\s+((?:\d{1,3},?)*\d+\.\d{2})?\s+((?:\d{1,3},?)*\d+\.\d{2})")
+    data = []
     for match in pattern.finditer(text):
         date, desc, credit, debit, balance = match.groups()
-        transactions.append({
-            "Date": datetime.strptime(date, "%d/%m/%Y"),
-            "Description": desc.strip(),
-            "Credit": float(credit.replace(",", "")) if credit else 0.0,
-            "Debit": float(debit.replace(",", "")) if debit else 0.0,
-            "Balance": float(balance.replace(",", "")) if balance else 0.0
-        })
-    return pd.DataFrame(transactions)
+        try:
+            data.append({
+                "Date": datetime.strptime(date, "%d/%m/%Y"),
+                "Description": desc.strip(),
+                "Credit": float(credit.replace(',', '')) if credit else 0.0,
+                "Debit": float(debit.replace(',', '')) if debit else 0.0,
+                "Balance": float(balance.replace(',', '')) if balance else 0.0
+            })
+        except:
+            continue
+    return pd.DataFrame(data)
 
-def parse_generic(text):
-    # Basic fallback parser
-    pattern = re.compile(r"(\d{2}/\d{2}/\d{4})\s+(.+?)\s+CR|DR\s+((?:\d{1,3},?)+\.\d{2})")
-    transactions = []
-    for match in pattern.finditer(text):
-        date, desc, amt = match.groups()
-        transactions.append({
-            "Date": datetime.strptime(date, "%d/%m/%Y"),
-            "Description": desc.strip(),
-            "Credit": float(amt.replace(",", "")) if "CR" in text else 0.0,
-            "Debit": float(amt.replace(",", "")) if "DR" in text else 0.0,
+def fallback_parser(text):
+    fallback_pattern = re.compile(
+        r'(?P<date>\d{2}/\d{2}/\d{4})\s+(?P<rest>.+?)(?=\n\d{2}/\d{2}/\d{4}|$)',
+        re.DOTALL
+    )
+    entries = []
+    for match in fallback_pattern.finditer(text):
+        date_str = match.group("date")
+        rest = match.group("rest").strip().replace('\n', ' ')
+        date = datetime.strptime(date_str, "%d/%m/%Y")
+
+        # Try to extract amounts from end of line
+        amount_matches = re.findall(r'(\d{1,3}(?:,\d{3})*\.\d{2})', rest)
+        credit = debit = 0.0
+        if "CR" in rest.upper():
+            credit = float(amount_matches[-1].replace(",", "")) if amount_matches else 0.0
+        elif "DR" in rest.upper():
+            debit = float(amount_matches[-1].replace(",", "")) if amount_matches else 0.0
+
+        entries.append({
+            "Date": date,
+            "Description": rest,
+            "Credit": credit,
+            "Debit": debit,
             "Balance": 0.0
         })
-    return pd.DataFrame(transactions)
+    return pd.DataFrame(entries)
 
-def generate_summary(df):
-    df["Month"] = df["Date"].dt.to_period("M")
-    summary = df.groupby("Month").agg({
-        "Credit": "sum",
-        "Debit": "sum",
-        "Balance": "mean"
-    }).rename(columns={"Balance": "Average Balance"})
-    return summary
-
-def detect_salary(df):
-    return df[df["Description"].str.contains("SALARY|PAYROLL|HRMS", case=False, na=False)]
-
-def detect_emi_bounces(df):
-    return df[df["Description"].str.contains("EMI|ACH RETURN|BOUNCE", case=False, na=False)]
-
-def detect_cash(df):
-    return df[(df["Credit"] > 100000) & (df["Description"].str.contains("CASH", case=False, na=False))]
+def classify_transactions(df):
+    df["Category"] = "Others"
+    df.loc[df["Description"].str.contains("SALARY|PAYROLL|HRMS", case=False, na=False), "Category"] = "Salary"
+    df.loc[df["Description"].str.contains("EMI|ACH RETURN|BOUNCE", case=False, na=False), "Category"] = "EMI Bounce"
+    df.loc[df["Description"].str.contains("UPI", case=False, na=False), "Category"] = "UPI"
+    df.loc[(df["Credit"] > 100000) & (df["Description"].str.contains("CASH", case=False, na=False)), "Category"] = "Suspicious Cash Deposit"
+    return df
 
 if uploaded_file:
-    raw_text = extract_text_from_pdf(uploaded_file)
-    bank_type = detect_bank(raw_text)
-    st.info(f"Detected Bank Type: {bank_type}")
+    text = extract_text(uploaded_file, pdf_password)
+    if not text:
+        st.stop()
 
-    if bank_type == "ICICI":
-        df = parse_icici(raw_text)
+    bank = detect_bank(text)
+    st.info(f"Detected Bank: {bank}")
+
+    if bank == "ICICI":
+        df = parse_icici(text)
     else:
-        df = parse_generic(raw_text)
+        df = fallback_parser(text)
 
     if not df.empty:
-        st.subheader("📋 Extracted Transactions")
+        df = classify_transactions(df)
+        st.subheader("📋 Transactions")
         st.dataframe(df)
 
-        st.subheader("📈 Monthly Summary")
-        summary = generate_summary(df)
+        st.subheader("📊 Summary by Category")
+        summary = df.groupby("Category").agg({"Credit": "sum", "Debit": "sum"}).reset_index()
         st.dataframe(summary)
 
-        st.subheader("💼 Salary Credits")
-        st.dataframe(detect_salary(df))
-
-        st.subheader("⚠️ EMI Bounces")
-        st.dataframe(detect_emi_bounces(df))
-
-        st.subheader("🚨 Suspicious Cash Deposits")
-        st.dataframe(detect_cash(df))
-
-        st.success("✅ Analysis completed.")
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download CSV", csv, "parsed_statement.csv", "text/csv")
     else:
-        st.warning("Unable to parse transactions from this statement.")
+        st.error("⚠️ Unable to parse transactions from this statement.")
