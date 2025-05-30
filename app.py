@@ -1,125 +1,107 @@
 import streamlit as st
 import pandas as pd
 import re
-from io import BytesIO
 from PyPDF2 import PdfReader
+from io import BytesIO
 from fpdf import FPDF
+from datetime import datetime
 
-st.set_page_config(page_title="Perfios-Like Bank Analyzer", layout="wide")
-st.title("🏦 Perfios-Like Bank Statement Analyzer")
+st.set_page_config(page_title="Multi-Bank Statement Analyzer", layout="wide")
+st.title("🏦 Multi-Bank Statement Analyzer (ICICI, HDFC, SBI)")
 
-uploaded_file = st.file_uploader("Upload a PDF bank statement", type="pdf")
+uploaded_file = st.file_uploader("Upload your bank statement PDF", type=["pdf"])
 
-if uploaded_file:
-    reader = PdfReader(uploaded_file)
-    text = "".join([page.extract_text() for page in reader.pages])
+def extract_text_from_pdf(file):
+    reader = PdfReader(file)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text()
+    return text
 
-    pattern = re.compile(
-        r"(\d{2}/\d{2}/\d{2})\s+([A-Z0-9\-\.\@\s]+?)\s+(\d{2}/\d{2}/\d{2})\s+((?:\d{1,3},?)+\.\d{2})?\s*((?:\d{1,3},?)+\.\d{2})?\s+((?:\d{1,3},?)+\.\d{2})"
-    )
+def detect_bank(text):
+    if "ICICI BANK" in text.upper():
+        return "ICICI"
+    elif "HDFC BANK" in text.upper():
+        return "HDFC"
+    elif "STATE BANK OF INDIA" in text.upper() or "SBI" in text.upper():
+        return "SBI"
+    else:
+        return "UNKNOWN"
 
+def parse_icici(text):
+    pattern = re.compile(r"(\d{2}/\d{2}/\d{4})\s+(.+?)\s+((?:\d{1,3},?)+\.\d{2})?\s+((?:\d{1,3},?)+\.\d{2})?\s+((?:\d{1,3},?)+\.\d{2})")
     transactions = []
     for match in pattern.finditer(text):
-        date, desc, val_date, wd, dp, bal = match.groups()
+        date, desc, credit, debit, balance = match.groups()
         transactions.append({
-            "Date": date,
+            "Date": datetime.strptime(date, "%d/%m/%Y"),
             "Description": desc.strip(),
-            "Value Date": val_date,
-            "Withdrawal Amt": float(wd.replace(',', '')) if wd else 0.0,
-            "Deposit Amt": float(dp.replace(',', '')) if dp else 0.0,
-            "Closing Balance": float(bal.replace(',', ''))
+            "Credit": float(credit.replace(",", "")) if credit else 0.0,
+            "Debit": float(debit.replace(",", "")) if debit else 0.0,
+            "Balance": float(balance.replace(",", "")) if balance else 0.0
         })
+    return pd.DataFrame(transactions)
 
-    df = pd.DataFrame(transactions)
-    df["Date"] = pd.to_datetime(df["Date"], format="%d/%m/%y")
+def parse_generic(text):
+    # Basic fallback parser
+    pattern = re.compile(r"(\d{2}/\d{2}/\d{4})\s+(.+?)\s+CR|DR\s+((?:\d{1,3},?)+\.\d{2})")
+    transactions = []
+    for match in pattern.finditer(text):
+        date, desc, amt = match.groups()
+        transactions.append({
+            "Date": datetime.strptime(date, "%d/%m/%Y"),
+            "Description": desc.strip(),
+            "Credit": float(amt.replace(",", "")) if "CR" in text else 0.0,
+            "Debit": float(amt.replace(",", "")) if "DR" in text else 0.0,
+            "Balance": 0.0
+        })
+    return pd.DataFrame(transactions)
+
+def generate_summary(df):
     df["Month"] = df["Date"].dt.to_period("M")
+    summary = df.groupby("Month").agg({
+        "Credit": "sum",
+        "Debit": "sum",
+        "Balance": "mean"
+    }).rename(columns={"Balance": "Average Balance"})
+    return summary
 
-    st.subheader("📊 Raw Transactions")
-    st.dataframe(df, use_container_width=True)
+def detect_salary(df):
+    return df[df["Description"].str.contains("SALARY|PAYROLL|HRMS", case=False, na=False)]
 
-    st.subheader("📌 Key Metrics")
+def detect_emi_bounces(df):
+    return df[df["Description"].str.contains("EMI|ACH RETURN|BOUNCE", case=False, na=False)]
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total Deposits", f"₹{df['Deposit Amt'].sum():,.2f}")
-    col2.metric("Total Withdrawals", f"₹{df['Withdrawal Amt'].sum():,.2f}")
-    col3.metric("Average Balance", f"₹{df['Closing Balance'].mean():,.2f}")
+def detect_cash(df):
+    return df[(df["Credit"] > 100000) & (df["Description"].str.contains("CASH", case=False, na=False))]
 
-    salary_keywords = r"\b(SALARY|PAYROLL|HRMS|SAL|EMPLOYER)\b"
-    emi_keywords = r"\b(EMI|BOUNCE|RETURN|ACH D-.*RETURN|REJECTED|CHARGES|FAIL)\b"
+if uploaded_file:
+    raw_text = extract_text_from_pdf(uploaded_file)
+    bank_type = detect_bank(raw_text)
+    st.info(f"Detected Bank Type: {bank_type}")
 
-    salary_df = df[df["Description"].str.contains(salary_keywords, case=False, na=False)]
-    emi_df = df[df["Description"].str.contains(emi_keywords, case=False, na=False)]
-
-    st.subheader("💼 Salary Credits")
-    st.write(salary_df if not salary_df.empty else "No salary credits detected.")
-
-    st.subheader("⚠️ EMI Bounce / Return Entries")
-    st.write(emi_df if not emi_df.empty else "No EMI bounce or return entries found.")
-
-    st.subheader("📈 Monthly Summary")
-    monthly_summary = df.groupby("Month")[["Deposit Amt", "Withdrawal Amt", "Closing Balance"]].agg({
-        "Deposit Amt": "sum",
-        "Withdrawal Amt": "sum",
-        "Closing Balance": "mean"
-    }).rename(columns={"Closing Balance": "Avg Balance"})
-    st.dataframe(monthly_summary)
-
-    st.subheader("🔍 Fraud Detection")
-    upi_df = df[df["Description"].str.contains("UPI", case=False, na=False)]
-    upi_freq = upi_df.groupby(df["Date"].dt.date).size().reset_index(name="UPI Txn Count")
-    flagged_days = upi_freq[upi_freq["UPI Txn Count"] > 5]
-    if not flagged_days.empty:
-        st.warning("High UPI usage (>5/day) detected on:")
-        st.dataframe(flagged_days)
+    if bank_type == "ICICI":
+        df = parse_icici(raw_text)
     else:
-        st.success("✅ No high-frequency UPI activity detected.")
+        df = parse_generic(raw_text)
 
-    st.subheader("🚨 Suspicious Cash Deposits")
-    suspicious_deposits = df[(df['Deposit Amt'] > 100000) & (df['Description'].str.contains("CASH", case=False, na=False))]
-    if not suspicious_deposits.empty:
-        st.warning("Large cash deposits detected:")
-        st.dataframe(suspicious_deposits)
+    if not df.empty:
+        st.subheader("📋 Extracted Transactions")
+        st.dataframe(df)
+
+        st.subheader("📈 Monthly Summary")
+        summary = generate_summary(df)
+        st.dataframe(summary)
+
+        st.subheader("💼 Salary Credits")
+        st.dataframe(detect_salary(df))
+
+        st.subheader("⚠️ EMI Bounces")
+        st.dataframe(detect_emi_bounces(df))
+
+        st.subheader("🚨 Suspicious Cash Deposits")
+        st.dataframe(detect_cash(df))
+
+        st.success("✅ Analysis completed.")
     else:
-        st.success("✅ No large cash deposits detected.")
-
-    st.subheader("📤 Export Options")
-
-    def convert_df(df):
-        return df.to_csv(index=False).encode('utf-8')
-
-    csv = convert_df(df)
-    st.download_button(
-        label="Download Transactions as CSV",
-        data=csv,
-        file_name='bank_statement_analysis.csv',
-        mime='text/csv',
-    )
-
-    def generate_pdf():
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font("Arial", size=12)
-        pdf.cell(200, 10, txt="Bank Statement Analysis Report", ln=1, align='C')
-        pdf.ln(10)
-        pdf.cell(200, 10, txt=f"Total Deposits: ₹{df['Deposit Amt'].sum():,.2f}", ln=1)
-        pdf.cell(200, 10, txt=f"Total Withdrawals: ₹{df['Withdrawal Amt'].sum():,.2f}", ln=1)
-        pdf.cell(200, 10, txt=f"Average Balance: ₹{df['Closing Balance'].mean():,.2f}", ln=1)
-        pdf.ln(10)
-        pdf.cell(200, 10, txt=f"Salary Credits: {len(salary_df)}", ln=1)
-        pdf.cell(200, 10, txt=f"EMI Bounces: {len(emi_df)}", ln=1)
-        pdf.cell(200, 10, txt=f"High-Frequency UPI Days: {len(flagged_days)}", ln=1)
-        pdf.cell(200, 10, txt=f"Suspicious Cash Deposits: {len(suspicious_deposits)}", ln=1)
-
-        output = BytesIO()
-        pdf.output(output)
-        return output.getvalue()
-
-    pdf_report = generate_pdf()
-    st.download_button(
-        label="Download Summary PDF",
-        data=pdf_report,
-        file_name="Bank_Statement_Summary.pdf",
-        mime="application/pdf"
-    )
-
-    st.success("✅ Analysis complete.")
+        st.warning("Unable to parse transactions from this statement.")
